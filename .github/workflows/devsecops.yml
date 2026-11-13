@@ -3,7 +3,7 @@ name: DevSecOps Pipeline
 # Fluxo:
 #   quality (Sonar) ──────┐
 #   security-iac (Trivy) ─┼──→ build (Docker + Trivy image + push Docker Hub) ──→ deploy (kind)
-#   security-code (Trivy)─┘
+#   security-code (Trivy)─┘                                        (runner local, cluster fica no ar)
 
 on:
   push:
@@ -204,20 +204,47 @@ jobs:
           docker push "$IMAGE"
           docker push "$LATEST"
 
-  # 5) Deploy no cluster kind usando a imagem publicada no Docker Hub
+  # 5) Deploy no cluster kind do RUNNER LOCAL (self-hosted).
+  #    O cluster NÃO é apagado no fim do job: o frontend continua no ar em
+  #    http://localhost:8080 na máquina do runner. Nos próximos runs o cluster
+  #    é reaproveitado e só a imagem do Deployment é atualizada.
+  #    Requisitos no runner: Docker rodando, kind, kubectl e curl no PATH.
   deploy:
-    name: deploy (kind)
-    runs-on: ubuntu-latest
+    name: deploy (kind no runner local)
+    runs-on: self-hosted
     needs: build
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    # Evita dois deploys ao mesmo tempo no mesmo cluster
+    concurrency:
+      group: deploy-kind-turismo
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+    env:
+      CLUSTER: turismo
+      KCTX: kind-turismo
     steps:
       - uses: actions/checkout@v7
 
-      - name: Criar cluster kind
-        uses: helm/kind-action@v1
-        with:
-          cluster_name: turismo
-          config: kind-config.yaml
+      - name: Verificar ferramentas do runner
+        run: |
+          for bin in docker kind kubectl curl; do
+            command -v "$bin" >/dev/null || { echo "::error::'$bin' não encontrado no PATH do runner"; exit 1; }
+          done
+          docker info >/dev/null || { echo "::error::Docker não está rodando no runner"; exit 1; }
+          kind version
+          kubectl version --client
+
+      # Não usa helm/kind-action porque ela apaga o cluster no fim do job.
+      - name: Criar cluster kind (só na primeira vez)
+        run: |
+          if kind get clusters | grep -qx "$CLUSTER"; then
+            echo "Cluster '$CLUSTER' já existe: reaproveitando"
+          else
+            kind create cluster --name "$CLUSTER" --config kind-config.yaml --wait 120s
+          fi
+          kubectl --context "$KCTX" cluster-info
 
       # O nome da imagem é montado aqui (e não lido do job build) porque o GitHub
       # descarta saídas de job que contêm secrets, como o usuário do Docker Hub.
@@ -228,34 +255,34 @@ jobs:
         run: |
           IMAGE="docker.io/${DOCKER_USER,,}/${IMAGE_NAME}:${GITHUB_SHA::7}"
           echo "Imagem: ${IMAGE}"
-          kubectl apply -f k8s/namespace.yaml
+          kubectl --context "$KCTX" apply -f k8s/namespace.yaml
           # Credencial do Docker Hub no cluster: funciona mesmo se o repositório
           # da imagem for privado e evita o limite de downloads anônimos
-          kubectl -n turismo create secret docker-registry dockerhub \
+          kubectl --context "$KCTX" -n turismo create secret docker-registry dockerhub \
             --docker-server=https://index.docker.io/v1/ \
             --docker-username="${DOCKER_USER}" --docker-password="${DOCKER_PASS}" \
-            --dry-run=client -o yaml | kubectl apply -f -
-          sed -E "s#image: .*destinos-do-brasil:.*#image: ${IMAGE}#" k8s/deployment.yaml | kubectl apply -f -
-          kubectl apply -f k8s/service.yaml
+            --dry-run=client -o yaml | kubectl --context "$KCTX" apply -f -
+          sed -E "s#image: .*destinos-do-brasil:.*#image: ${IMAGE}#" k8s/deployment.yaml | kubectl --context "$KCTX" apply -f -
+          kubectl --context "$KCTX" apply -f k8s/service.yaml
 
       - name: Aguardar o rollout
-        run: kubectl -n turismo rollout status deployment/destinos-frontend --timeout=180s
+        run: kubectl --context "$KCTX" -n turismo rollout status deployment/destinos-frontend --timeout=180s
 
       - name: Diagnóstico (só se o deploy falhar)
         if: failure()
         run: |
-          kubectl -n turismo get deploy,rs,pods,svc -o wide || true
+          kubectl --context "$KCTX" -n turismo get deploy,rs,pods,svc -o wide || true
           echo "================ describe pods ================"
-          kubectl -n turismo describe pods -l app=destinos-frontend || true
+          kubectl --context "$KCTX" -n turismo describe pods -l app=destinos-frontend || true
           echo "================ eventos ================"
-          kubectl -n turismo get events --sort-by=.lastTimestamp || true
+          kubectl --context "$KCTX" -n turismo get events --sort-by=.lastTimestamp || true
           echo "================ logs ================"
-          kubectl -n turismo logs -l app=destinos-frontend --all-containers --tail=50 || true
+          kubectl --context "$KCTX" -n turismo logs -l app=destinos-frontend --all-containers --tail=50 || true
 
       - name: Verificar o frontend no ar
         run: |
-          kubectl -n turismo get pods,svc -o wide
-          kubectl -n turismo get deployment destinos-frontend -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+          kubectl --context "$KCTX" -n turismo get pods,svc -o wide
+          kubectl --context "$KCTX" -n turismo get deployment destinos-frontend -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
           # A porta 30080 do nó kind está mapeada para localhost:8080 (kind-config.yaml)
           for i in $(seq 1 10); do
             curl -fsS http://localhost:8080/healthz && break
@@ -263,6 +290,7 @@ jobs:
           done
           curl -fsS http://localhost:8080/ | grep -o '<title>.*</title>'
           curl -fsS http://localhost:8080/ -o pagina.html
+          echo "Frontend continua no ar em http://localhost:8080"
 
       - name: Salvar página servida pelo cluster
         uses: actions/upload-artifact@v7
