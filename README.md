@@ -12,7 +12,7 @@ security-code (Trivy fs) ───┘   (Docker + Trivy image + push Docker Hub)
 
 | Etapa do trabalho | Job | O que faz |
 |---|---|---|
-| 1. Build | `build` | `docker build` da imagem do frontend |
+| 1. Build | `build` | `docker build` da imagemm do frontend |
 | 2. Sonar | `quality` | Testes + cobertura, análise no SonarQube e **Quality Gate** (falha o job se não passar) |
 | 3. Trivy | `security-iac`, `security-code`, `build` | Scan de IaC (Dockerfile e K8s), de secrets e dependências do código, e da imagem Docker. Bloqueia em HIGH/CRITICAL |
 | 4. Push | `build` | Publica `usuario/destinos-do-brasil:<commit>` e `:latest` no Docker Hub |
